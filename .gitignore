@@ -1,0 +1,23 @@
+# Project-root .gitignore — extends app/.gitignore
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Local SQLite database (use Postgres in production via DATABASE_URL)
+app/data/tracker.db
+app/data/tracker.db-journal
+app/data/builds/
+
+# Streamlit secrets — never commit
+.streamlit/secrets.toml
+app/.streamlit/secrets.toml
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
