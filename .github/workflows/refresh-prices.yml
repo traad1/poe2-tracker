@@ -1,0 +1,31 @@
+name: Refresh poe2scout prices
+
+# Cron runs every 3 hours. GitHub schedules in UTC and may delay free-tier jobs by a few minutes
+# during peak load — that's fine, this isn't latency-sensitive.
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch: {}  # Allow manual triggering from the Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: app/requirements.txt
+
+      - name: Install deps
+        working-directory: app
+        run: pip install -r requirements.txt
+
+      - name: Run refresh
+        working-directory: app
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m poe2.refresh

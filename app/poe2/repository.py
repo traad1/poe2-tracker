@@ -146,6 +146,16 @@ SQLITE_DDL = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_costline_lot ON lot_cost_line(lot_id)",
+    """
+    CREATE TABLE IF NOT EXISTS price_history (
+        league      TEXT NOT NULL,
+        item_id     INTEGER NOT NULL,
+        fetched_at  TEXT NOT NULL,
+        price_ex    REAL,
+        PRIMARY KEY (league, item_id, fetched_at)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_history_item ON price_history(league, item_id, fetched_at)",
 ]
 
 POSTGRES_DDL = [
@@ -214,6 +224,16 @@ POSTGRES_DDL = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_costline_lot ON lot_cost_line(lot_id)",
+    """
+    CREATE TABLE IF NOT EXISTS price_history (
+        league      TEXT NOT NULL,
+        item_id     INTEGER NOT NULL,
+        fetched_at  TEXT NOT NULL,
+        price_ex    DOUBLE PRECISION,
+        PRIMARY KEY (league, item_id, fetched_at)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_history_item ON price_history(league, item_id, fetched_at)",
 ]
 
 
@@ -300,10 +320,105 @@ def refresh_prices(
     payload = [{**r, "league": league, "fetched_at": now} for r in rows]
     if not payload:
         return 0
+    history_payload = [
+        {"league": league, "item_id": r["item_id"], "fetched_at": now,
+         "price_ex": r.get("current_price_ex")}
+        for r in rows
+    ]
     engine = get_engine()
     with engine.begin() as con:
         con.execute(text(_PRICE_UPSERT), payload)
+        # Append-only history: PK (league, item_id, fetched_at) ensures dedupe on retry.
+        con.execute(
+            text(
+                "INSERT INTO price_history (league, item_id, fetched_at, price_ex) "
+                "VALUES (:league, :item_id, :fetched_at, :price_ex) "
+                "ON CONFLICT (league, item_id, fetched_at) DO NOTHING"
+            ),
+            history_payload,
+        )
     return len(payload)
+
+
+def trends(
+    league: str,
+    min_price_ex: float = 0.0,
+    lookback_24h_tolerance_hours: float = 6.0,
+) -> pd.DataFrame:
+    """Compute per-item trend metrics from price_history + the current snapshot.
+
+    Returns one row per item with: name, category, icon_url, current_price_ex,
+    price_24h_ago_ex (best history row closest to 24h ago, within tolerance),
+    price_7d_ago_ex, change_24h_pct, change_24h_ex, change_7d_pct.
+
+    Items with no usable history are still returned with NaN deltas — UI can filter.
+    `min_price_ex` filters out garbage rows where small absolute moves blow up %.
+    """
+    df = _read_sql(
+        """
+        SELECT p.item_id, p.name, p.category, p.icon_url, p.current_price_ex
+          FROM price_snapshot p
+         WHERE p.league = :league
+        """,
+        {"league": league},
+    )
+    if df.empty:
+        return df
+
+    history = _read_sql(
+        "SELECT item_id, fetched_at, price_ex FROM price_history WHERE league = :league",
+        {"league": league},
+    )
+
+    df["current_price_ex"] = pd.to_numeric(df["current_price_ex"], errors="coerce")
+
+    if history.empty:
+        df["price_24h_ago_ex"] = pd.NA
+        df["price_7d_ago_ex"] = pd.NA
+        df["change_24h_pct"] = pd.NA
+        df["change_24h_ex"] = pd.NA
+        df["change_7d_pct"] = pd.NA
+        return df[df["current_price_ex"] >= min_price_ex].copy()
+
+    history["fetched_at_dt"] = pd.to_datetime(history["fetched_at"], utc=True)
+    history["price_ex"] = pd.to_numeric(history["price_ex"], errors="coerce")
+    now = pd.Timestamp.now(tz="UTC")
+    target_24h = now - pd.Timedelta(hours=24)
+    target_7d = now - pd.Timedelta(days=7)
+    tol = pd.Timedelta(hours=lookback_24h_tolerance_hours)
+
+    # For each item, find the history row closest to 24h-ago (within tolerance) and 7d-ago.
+    def closest_within(group: pd.DataFrame, target: pd.Timestamp, tolerance: pd.Timedelta):
+        group = group.dropna(subset=["price_ex"])
+        if group.empty:
+            return None
+        diffs = (group["fetched_at_dt"] - target).abs()
+        idx = diffs.idxmin()
+        if diffs.loc[idx] > tolerance:
+            return None
+        return float(group.loc[idx, "price_ex"])
+
+    def _lookup_frame(target: pd.Timestamp, tolerance: pd.Timedelta, col: str) -> pd.DataFrame:
+        results = {
+            int(item_id): closest_within(group, target, tolerance)
+            for item_id, group in history.groupby("item_id")
+        }
+        return pd.DataFrame({"item_id": list(results.keys()), col: list(results.values())})
+
+    p24_df = _lookup_frame(target_24h, tol, "price_24h_ago_ex")
+    p7d_df = _lookup_frame(target_7d, pd.Timedelta(days=2), "price_7d_ago_ex")
+    df = df.merge(p24_df, how="left", on="item_id")
+    df = df.merge(p7d_df, how="left", on="item_id")
+    df["price_24h_ago_ex"] = pd.to_numeric(df["price_24h_ago_ex"], errors="coerce")
+    df["price_7d_ago_ex"] = pd.to_numeric(df["price_7d_ago_ex"], errors="coerce")
+
+    df["change_24h_ex"] = df["current_price_ex"] - df["price_24h_ago_ex"]
+    df["change_24h_pct"] = (df["change_24h_ex"] / df["price_24h_ago_ex"] * 100).round(2)
+    df["change_7d_pct"] = (
+        (df["current_price_ex"] - df["price_7d_ago_ex"]) / df["price_7d_ago_ex"] * 100
+    ).round(2)
+    df = df[df["current_price_ex"] >= min_price_ex].copy()
+    return df
 
 
 def _read_sql(query: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
