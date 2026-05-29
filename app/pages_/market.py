@@ -149,26 +149,48 @@ def _render_market_table(league: str, df: pd.DataFrame) -> None:
 
     view["poe2db"] = view["name"].apply(poe2db_url)
 
+    # Confidence marker: items with <5 listings get a ⚠️ prefix on the Item column.
+    # Mirrors poe.ninja's "low confidence" treatment without needing a separate column.
+    LOW_CONF_THRESHOLD = 5
+
+    def _label(row) -> str:
+        lc = row.get("listing_count")
+        marker = "⚠️ " if pd.notna(lc) and lc < LOW_CONF_THRESHOLD else ""
+        return marker + str(row["name"])
+
+    view["item_label"] = view.apply(_label, axis=1)
+
+    cols = ["icon_url", "item_label", "category", "current_price_ex", "price_div",
+            "listing_count", "sparkline", "change_24h_pct", "poe2db"]
+
     st.dataframe(
-        view[["icon_url", "name", "category", "current_price_ex", "price_div",
-              "price_24h_ago_ex", "change_24h_pct", "poe2db"]]
-            .rename(columns={
-                "icon_url": " ",
-                "name": "Item",
-                "category": "Category",
-                "current_price_ex": "Price (ex)",
-                "price_div": "Price (div)",
-                "price_24h_ago_ex": "24h ago (ex)",
-                "change_24h_pct": "24h Δ %",
-                "poe2db": "poe2db",
-            }),
+        view[cols].rename(columns={
+            "icon_url": " ",
+            "item_label": "Item",
+            "category": "Category",
+            "current_price_ex": "Price (ex)",
+            "price_div": "Price (div)",
+            "listing_count": "Listings",
+            "sparkline": "Trend",
+            "change_24h_pct": "24h Δ %",
+            "poe2db": "poe2db",
+        }),
         use_container_width=True,
         hide_index=True,
         column_config={
             " ": st.column_config.ImageColumn("", width="small"),
+            "Item": st.column_config.TextColumn(
+                "Item",
+                help=f"⚠️ marks items with fewer than {LOW_CONF_THRESHOLD} active listings — "
+                     "their displayed price may be a single fake listing.",
+            ),
             "Price (ex)": st.column_config.NumberColumn(format="%.2f"),
             "Price (div)": st.column_config.NumberColumn(format="%.3f"),
-            "24h ago (ex)": st.column_config.NumberColumn(format="%.2f"),
+            "Listings": st.column_config.NumberColumn(format="%d"),
+            "Trend": st.column_config.LineChartColumn(
+                "Trend", help="poe2scout's 7-day daily series, or our own snapshot history "
+                              "as a fallback.",
+            ),
             "24h Δ %": st.column_config.NumberColumn(format="%+.1f%%"),
             "poe2db": st.column_config.LinkColumn("poe2db", display_text="open ↗"),
         },

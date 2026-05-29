@@ -90,6 +90,8 @@ SQLITE_DDL = [
         category     TEXT NOT NULL,
         current_price_ex REAL,
         price_24h_ago_ex REAL,
+        listing_count   INTEGER,
+        price_logs_json TEXT,
         icon_url     TEXT,
         fetched_at   TEXT NOT NULL,
         PRIMARY KEY (league, item_id)
@@ -168,6 +170,8 @@ POSTGRES_DDL = [
         category     TEXT NOT NULL,
         current_price_ex DOUBLE PRECISION,
         price_24h_ago_ex DOUBLE PRECISION,
+        listing_count   INTEGER,
+        price_logs_json TEXT,
         icon_url     TEXT,
         fetched_at   TEXT NOT NULL,
         PRIMARY KEY (league, item_id)
@@ -242,20 +246,39 @@ def _init_schema(engine: Engine) -> None:
     with engine.begin() as con:
         for stmt in ddl:
             con.execute(text(stmt))
-        # Migration: older local SQLite DBs may lack watchlist.tag — add it if missing.
         if _is_sqlite(engine):
-            cols = {row[1] for row in con.exec_driver_sql("PRAGMA table_info(watchlist)").fetchall()}
-            if "tag" not in cols:
+            wl_cols = {row[1] for row in con.exec_driver_sql(
+                "PRAGMA table_info(watchlist)").fetchall()}
+            if "tag" not in wl_cols:
                 con.exec_driver_sql(
                     "ALTER TABLE watchlist ADD COLUMN tag TEXT NOT NULL DEFAULT 'flip'"
                 )
+            snap_cols = {row[1] for row in con.exec_driver_sql(
+                "PRAGMA table_info(price_snapshot)").fetchall()}
+            if "listing_count" not in snap_cols:
+                con.exec_driver_sql("ALTER TABLE price_snapshot ADD COLUMN listing_count INTEGER")
+            if "price_logs_json" not in snap_cols:
+                con.exec_driver_sql("ALTER TABLE price_snapshot ADD COLUMN price_logs_json TEXT")
+        else:
+            # Postgres: IF NOT EXISTS makes these safe to run every boot.
+            con.execute(text(
+                "ALTER TABLE price_snapshot ADD COLUMN IF NOT EXISTS listing_count INTEGER"
+            ))
+            con.execute(text(
+                "ALTER TABLE price_snapshot ADD COLUMN IF NOT EXISTS price_logs_json TEXT"
+            ))
 
 
 # ---------- price cache ----------
 
 def _flatten_item(raw: dict, category_label: str) -> dict:
-    logs = [p for p in (raw.get("PriceLogs") or []) if p]
-    price_24h = logs[0]["Price"] if logs else None
+    import json as _json
+    raw_logs = raw.get("PriceLogs") or []
+    # PriceLogs is a 7-element array of {"Price": float, ...} or null per day.
+    # Use the first non-null log as the "24h ago" reference (kept for back-compat with the
+    # existing 24h Δ column). For the sparkline, persist the full log array as JSON.
+    logs = [p for p in raw_logs if p]
+    price_24h = logs[0].get("Price") if logs else None
     return {
         "item_id": raw["ItemId"],
         "api_id": raw.get("ApiId") or raw.get("Text"),
@@ -263,6 +286,8 @@ def _flatten_item(raw: dict, category_label: str) -> dict:
         "category": category_label,
         "current_price_ex": raw.get("CurrentPrice"),
         "price_24h_ago_ex": price_24h,
+        "listing_count": raw.get("CurrentQuantity"),
+        "price_logs_json": _json.dumps(raw_logs) if raw_logs else None,
         "icon_url": raw.get("IconUrl"),
     }
 
@@ -272,15 +297,21 @@ def _flatten_item(raw: dict, category_label: str) -> dict:
 
 _PRICE_UPSERT = """
 INSERT INTO price_snapshot (league, item_id, api_id, name, category,
-                            current_price_ex, price_24h_ago_ex, icon_url, fetched_at)
+                            current_price_ex, price_24h_ago_ex,
+                            listing_count, price_logs_json,
+                            icon_url, fetched_at)
 VALUES (:league, :item_id, :api_id, :name, :category,
-        :current_price_ex, :price_24h_ago_ex, :icon_url, :fetched_at)
+        :current_price_ex, :price_24h_ago_ex,
+        :listing_count, :price_logs_json,
+        :icon_url, :fetched_at)
 ON CONFLICT (league, item_id) DO UPDATE SET
     api_id = EXCLUDED.api_id,
     name = EXCLUDED.name,
     category = EXCLUDED.category,
     current_price_ex = EXCLUDED.current_price_ex,
     price_24h_ago_ex = EXCLUDED.price_24h_ago_ex,
+    listing_count = EXCLUDED.listing_count,
+    price_logs_json = EXCLUDED.price_logs_json,
     icon_url = EXCLUDED.icon_url,
     fetched_at = EXCLUDED.fetched_at
 """
@@ -356,7 +387,8 @@ def trends(
     """
     df = _read_sql(
         """
-        SELECT p.item_id, p.name, p.category, p.icon_url, p.current_price_ex
+        SELECT p.item_id, p.name, p.category, p.icon_url, p.current_price_ex,
+               p.listing_count, p.price_logs_json
           FROM price_snapshot p
          WHERE p.league = :league
         """,
@@ -371,6 +403,9 @@ def trends(
     )
 
     df["current_price_ex"] = pd.to_numeric(df["current_price_ex"], errors="coerce")
+    df["listing_count"] = pd.to_numeric(df["listing_count"], errors="coerce")
+    fallback = _history_sparklines(league)
+    df["sparkline"] = df.apply(lambda r: _build_sparkline(r, fallback), axis=1)
 
     if history.empty:
         df["price_24h_ago_ex"] = pd.NA
@@ -467,7 +502,64 @@ def load_prices(league: str) -> pd.DataFrame:
     df["current_price_ex"] = cur
     df["price_24h_ago_ex"] = prev
     df["change_24h_pct"] = ((cur - prev) / prev * 100).round(2)
+    if "listing_count" in df.columns:
+        df["listing_count"] = pd.to_numeric(df["listing_count"], errors="coerce")
+
+    fallback = _history_sparklines(league)
+    df["sparkline"] = df.apply(lambda r: _build_sparkline(r, fallback), axis=1)
     return df
+
+
+def _history_sparklines(league: str) -> dict[int, list[float]]:
+    """Per-item sparkline series from our own price_history table.
+
+    Used as a fallback when poe2scout's PriceLogs is empty (e.g. early league).
+    Returns up to the last 14 snapshots per item, in chronological order.
+    """
+    df = _read_sql(
+        """
+        SELECT item_id, price_ex
+          FROM price_history
+         WHERE league = :league
+         ORDER BY item_id, fetched_at ASC
+        """,
+        {"league": league},
+    )
+    if df.empty:
+        return {}
+    df["price_ex"] = pd.to_numeric(df["price_ex"], errors="coerce")
+    out: dict[int, list[float]] = {}
+    for item_id, group in df.groupby("item_id"):
+        series = [float(v) for v in group["price_ex"].dropna().tolist()]
+        if series:
+            out[int(item_id)] = series[-14:]
+    return out
+
+
+def _build_sparkline(row, fallback: dict[int, list[float]]) -> list[float]:
+    """Build a numeric series for a row's sparkline.
+
+    Source priority:
+    1. poe2scout's PriceLogs (7 daily entries) when populated. We append current price
+       so the line ends "today" not 24h ago.
+    2. Our own price_history rolled up.
+    3. Empty list — Streamlit renders this as no line, which is fine for "no data yet".
+    """
+    import json as _json
+    logs_raw = row.get("price_logs_json")
+    if logs_raw:
+        try:
+            logs = _json.loads(logs_raw)
+        except (ValueError, TypeError):
+            logs = []
+        series = [float(e["Price"]) for e in logs
+                  if isinstance(e, dict) and e.get("Price") is not None]
+        if series:
+            cur = row.get("current_price_ex")
+            if pd.notna(cur):
+                series.append(float(cur))
+            return series
+    return fallback.get(int(row["item_id"]), [])
 
 
 def cache_age_minutes(league: str) -> float | None:

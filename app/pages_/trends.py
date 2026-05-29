@@ -18,15 +18,20 @@ def render(league: str) -> None:
 
     div_ex = repo.divine_price_ex(league)
 
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     with c1:
         top_n = st.number_input("Top N", min_value=5, max_value=100, value=10, step=5)
     with c2:
         min_price = st.number_input(
             "Min price (ex)", min_value=0.0, value=5.0, step=1.0,
-            help="Filter out junk items where a 0.01→0.05 ex bump shows as a 400% gainer.",
+            help="Filter out junk where a 0.01→0.05 ex bump shows as a 400% gainer.",
         )
     with c3:
+        min_listings = st.number_input(
+            "Min listings", min_value=0, value=5, step=1,
+            help="Filters out low-confidence prices. poe.ninja-style: <5 listings is suspicious.",
+        )
+    with c4:
         all_cats = sorted(repo.load_prices(league)["category"].dropna().unique().tolist())
         chosen_cats = st.multiselect(
             "Categories", options=all_cats, default=all_cats,
@@ -34,6 +39,8 @@ def render(league: str) -> None:
         )
 
     df = repo.trends(league, min_price_ex=float(min_price))
+    if min_listings > 0:
+        df = df[df["listing_count"].fillna(0) >= min_listings]
     if df.empty:
         st.info(
             "No price data yet. Either nobody has triggered a refresh, or the league has "
@@ -124,20 +131,30 @@ def _render_table(
         st.info("No items with enough history yet. Wait a few cron cycles.")
         return
 
-    cols = ["icon_url", "name", "category", "current_price_ex"]
+    LOW_CONF_THRESHOLD = 5
+    view = view.copy()
+    view["item_label"] = view.apply(
+        lambda r: ("⚠️ " if pd.notna(r.get("listing_count"))
+                   and r["listing_count"] < LOW_CONF_THRESHOLD else "") + str(r["name"]),
+        axis=1,
+    )
+
+    cols = ["icon_url", "item_label", "category", "current_price_ex"]
     rename = {
         "icon_url": " ",
-        "name": "Item",
+        "item_label": "Item",
         "category": "Category",
         "current_price_ex": "Price (ex)",
     }
     if div_ex:
         cols.append("current_price_div")
         rename["current_price_div"] = "Price (div)"
-    cols += ["price_24h_ago_ex", "change_24h_pct", "change_24h_ex",
+    cols += ["listing_count", "sparkline",
+             "change_24h_pct", "change_24h_ex",
              "change_7d_pct", "volatility_pct", "poe2db"]
     rename.update({
-        "price_24h_ago_ex": "24h ago (ex)",
+        "listing_count": "Listings",
+        "sparkline": "Trend",
         "change_24h_pct": "24h Δ %",
         "change_24h_ex": "24h Δ (ex)",
         "change_7d_pct": "7d Δ %",
@@ -151,9 +168,16 @@ def _render_table(
         hide_index=True,
         column_config={
             " ": st.column_config.ImageColumn("", width="small"),
+            "Item": st.column_config.TextColumn(
+                "Item", help="⚠️ = <5 active listings; price may be a single fake listing.",
+            ),
             "Price (ex)": st.column_config.NumberColumn(format="%.2f"),
             "Price (div)": st.column_config.NumberColumn(format="%.3f"),
-            "24h ago (ex)": st.column_config.NumberColumn(format="%.2f"),
+            "Listings": st.column_config.NumberColumn(format="%d"),
+            "Trend": st.column_config.LineChartColumn(
+                "Trend", help="7-day daily series from poe2scout, with our snapshot history "
+                              "as a fallback.",
+            ),
             "24h Δ %": st.column_config.NumberColumn(format="%+.1f%%"),
             "24h Δ (ex)": st.column_config.NumberColumn(format="%+.2f"),
             "7d Δ %": st.column_config.NumberColumn(format="%+.1f%%"),
