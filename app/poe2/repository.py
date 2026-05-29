@@ -417,7 +417,40 @@ def trends(
     df["change_7d_pct"] = (
         (df["current_price_ex"] - df["price_7d_ago_ex"]) / df["price_7d_ago_ex"] * 100
     ).round(2)
+
+    # Volatility: coefficient of variation (std / mean) over the last 7 days of history,
+    # expressed as percent. Items with <3 history points get NaN. CoV normalizes across
+    # very different price levels so a Mirror moving ±1k ex doesn't dominate a 5-ex item.
+    recent = history[history["fetched_at_dt"] >= now - pd.Timedelta(days=7)].copy()
+    if not recent.empty:
+        agg = recent.groupby("item_id")["price_ex"].agg(["std", "mean", "count"])
+        agg = agg[agg["count"] >= 3]
+        agg["volatility_pct"] = (agg["std"] / agg["mean"] * 100).round(2)
+        vol_df = agg[["volatility_pct"]].reset_index()
+        df = df.merge(vol_df, how="left", on="item_id")
+    else:
+        df["volatility_pct"] = pd.NA
+    df["volatility_pct"] = pd.to_numeric(df["volatility_pct"], errors="coerce")
+
     df = df[df["current_price_ex"] >= min_price_ex].copy()
+    return df
+
+
+def load_item_history(league: str, item_id: int) -> pd.DataFrame:
+    """All price snapshots for a single item, oldest first. For the per-item chart."""
+    df = _read_sql(
+        """
+        SELECT fetched_at, price_ex
+          FROM price_history
+         WHERE league = :league AND item_id = :item_id
+         ORDER BY fetched_at ASC
+        """,
+        {"league": league, "item_id": item_id},
+    )
+    if df.empty:
+        return df
+    df["fetched_at"] = pd.to_datetime(df["fetched_at"], utc=True)
+    df["price_ex"] = pd.to_numeric(df["price_ex"], errors="coerce")
     return df
 
 
