@@ -56,13 +56,15 @@ def render(league: str) -> None:
 
     df["poe2db"] = df["name"].apply(poe2db_url)
 
-    tab_gain, tab_loss, tab_all, tab_item = st.tabs(
-        ["📈 Gainers", "📉 Losers", "All movers", "Item detail"]
+    tab_gain, tab_loss, tab_cheap, tab_all, tab_item = st.tabs(
+        ["📈 Gainers", "📉 Losers", "💰 Cheap flips", "All movers", "Item detail"]
     )
     with tab_gain:
         _render_table(df, sort_col="change_24h_pct", ascending=False, top_n=int(top_n), div_ex=div_ex)
     with tab_loss:
         _render_table(df, sort_col="change_24h_pct", ascending=True, top_n=int(top_n), div_ex=div_ex)
+    with tab_cheap:
+        _render_cheap_flips(df, div_ex)
     with tab_all:
         st.caption("Click any column header to re-sort. Volatility = coefficient of variation "
                    "over the last 7 days (std / mean × 100), so it's comparable across price levels. "
@@ -70,6 +72,136 @@ def render(league: str) -> None:
         _render_table(df, sort_col="change_24h_pct", ascending=False, top_n=None, div_ex=div_ex)
     with tab_item:
         _render_item_detail(league, df, div_ex)
+
+
+def _render_cheap_flips(df: pd.DataFrame, div_ex: float | None) -> None:
+    """Cheap, rising items — what to look for during drops to resell.
+
+    Score formula (printed below the controls so it's auditable, not a black box):
+        score = 0.6 * 24h_Δ_% + 0.4 * 7d_Δ_% - listings_penalty
+        listings_penalty: 20 if null/0, 10 if <5, 5 if <20, else 0
+    Items must have positive 24h AND 7d Δ to qualify (we want rising, not falling).
+    """
+    st.caption(
+        "Items priced under your cap with sustained upward momentum. Good for hoovering up "
+        "during farming sessions to resell once they hit a higher tier. **Both 24h and 7d Δ "
+        "must be positive** — this avoids buying tops."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        price_cap = st.slider(
+            "Price cap (ex)", min_value=1, max_value=100, value=10, step=1,
+            help="Max current price to include. Smaller cap = cheaper farming targets.",
+        )
+    with c2:
+        cheap_n = st.selectbox("Show top", [5, 10, 25], index=0, key="cheap_flips_n")
+
+    qualified = df.copy()
+    qualified = qualified[qualified["current_price_ex"] <= price_cap]
+    qualified = qualified[
+        qualified["change_24h_pct"].fillna(-1) > 0
+    ]
+    qualified = qualified[
+        qualified["change_7d_pct"].fillna(-1) > 0
+    ]
+
+    if qualified.empty:
+        st.info(
+            f"No rising items at or under {price_cap} ex right now. Either everything cheap is "
+            "flat/falling, or the cron hasn't accumulated enough history yet (24h and 7d Δ "
+            "need at least one snapshot from those time windows)."
+        )
+        with st.expander("Score formula"):
+            st.code(
+                "score = 0.6 × 24h_Δ_% + 0.4 × 7d_Δ_% − listings_penalty\n"
+                "listings_penalty:\n"
+                "  20  if listings is null or 0\n"
+                "  10  if listings < 5\n"
+                "   5  if listings < 20\n"
+                "   0  otherwise",
+                language="text",
+            )
+        return
+
+    def _penalty(listings) -> float:
+        if pd.isna(listings) or listings == 0:
+            return 20.0
+        if listings < 5:
+            return 10.0
+        if listings < 20:
+            return 5.0
+        return 0.0
+
+    qualified["listings_penalty"] = qualified["listing_count"].apply(_penalty)
+    qualified["score"] = (
+        qualified["change_24h_pct"].fillna(0) * 0.6
+        + qualified["change_7d_pct"].fillna(0) * 0.4
+        - qualified["listings_penalty"]
+    ).round(2)
+
+    qualified = qualified.sort_values("score", ascending=False).head(int(cheap_n))
+    qualified["item_label"] = qualified.apply(
+        lambda r: ("⚠️ " if pd.notna(r.get("listing_count"))
+                   and r["listing_count"] < 5 else "") + str(r["name"]),
+        axis=1,
+    )
+
+    cols = ["icon_url", "item_label", "category", "current_price_ex"]
+    rename = {
+        "icon_url": " ",
+        "item_label": "Item",
+        "category": "Category",
+        "current_price_ex": "Price (ex)",
+    }
+    if div_ex:
+        qualified["current_price_div"] = (qualified["current_price_ex"] / div_ex).round(3)
+        cols.append("current_price_div")
+        rename["current_price_div"] = "Price (div)"
+    cols += ["listing_count", "sparkline", "change_24h_pct", "change_7d_pct", "score", "poe2db"]
+    rename.update({
+        "listing_count": "Listings",
+        "sparkline": "Trend",
+        "change_24h_pct": "24h Δ %",
+        "change_7d_pct": "7d Δ %",
+        "score": "Score",
+        "poe2db": "poe2db",
+    })
+
+    st.dataframe(
+        qualified[cols].rename(columns=rename),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            " ": st.column_config.ImageColumn("", width="small"),
+            "Item": st.column_config.TextColumn(
+                "Item", help="⚠️ = <5 active listings; price may be a single fake listing.",
+            ),
+            "Price (ex)": st.column_config.NumberColumn(format="%.2f"),
+            "Price (div)": st.column_config.NumberColumn(format="%.3f"),
+            "Listings": st.column_config.NumberColumn(format="%d"),
+            "Trend": st.column_config.LineChartColumn("Trend"),
+            "24h Δ %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "7d Δ %": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Score": st.column_config.NumberColumn(
+                format="%.1f",
+                help="0.6 × 24h_Δ_% + 0.4 × 7d_Δ_% − listings_penalty. Higher = better.",
+            ),
+            "poe2db": st.column_config.LinkColumn("poe2db", display_text="open ↗"),
+        },
+    )
+
+    with st.expander("Score formula"):
+        st.code(
+            "score = 0.6 × 24h_Δ_% + 0.4 × 7d_Δ_% − listings_penalty\n"
+            "listings_penalty:\n"
+            "  20  if listings is null or 0\n"
+            "  10  if listings < 5\n"
+            "   5  if listings < 20\n"
+            "   0  otherwise\n\n"
+            "Eligibility: must have positive 24h Δ AND positive 7d Δ.",
+            language="text",
+        )
 
 
 def _render_item_detail(league: str, trends_df: pd.DataFrame, div_ex: float | None) -> None:
